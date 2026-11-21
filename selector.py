@@ -782,10 +782,8 @@ def _stmt_index(path):
     if path in _STMTS:
         return _STMTS[path]
     spans = []
-    text = read_source(path)
-    try:
-        tree = ast.parse(text)
-    except Exception:
+    tree = base_tree(path)
+    if tree is None:
         _STMTS[path] = None
         return None
     for node in ast.walk(tree):
@@ -818,14 +816,34 @@ def stmt_span(path, line):
     return best
 
 
+_TREES = {}
+
+
+def base_tree(path):
+    """Parsed AST of the pinned source of `path` (cached), or None."""
+    if path not in _TREES:
+        try:
+            _TREES[path] = ast.parse(read_source(path))
+        except Exception:
+            _TREES[path] = None
+    return _TREES[path]
+
+
 def ast_equivalent(path, hunks):
-    text = read_source(path)
+    # Only edits made of comments and blank lines can leave the AST unchanged in practice;
+    # anything else is decided by the rules below without the (slow) full comparison.
+    for hunk in hunks:
+        for tag, line in hunk["seq"]:
+            if tag != " " and line.strip() and not line.strip().startswith("#"):
+                return False
+    old = base_tree(path)
+    if old is None:
+        return False
     try:
-        a = ast.dump(ast.parse(text))
-        b = ast.dump(ast.parse(patched_text(text, hunks)))
+        new = ast.parse(patched_text(read_source(path), hunks))
     except Exception:
         return False
-    return a == b
+    return ast.dump(old) == ast.dump(new)
 
 
 CLASS_MODE = os.environ.get("CLASS_MODE", "1") == "1"
@@ -843,7 +861,10 @@ def _run_file(path):
                 _RUNMAP = json.load(handle)
         except Exception:
             _RUNMAP = {}
-    return _RUNMAP.get(path, {})
+    value = _RUNMAP.get(path, {})
+    if isinstance(value, str):
+        value = _RUNMAP[path] = json.loads(value)
+    return value
 
 
 def run_range_mask(path, low, high):
@@ -892,6 +913,362 @@ def class_usage(path, line):
     return to_mask(value) if value is not None else None
 
 
+ATTR_MODE = os.environ.get("ATTR_MODE", "1") == "1"
+_ATTRS = None
+_HOOK_NAMES = None
+
+
+def _attrs():
+    global _ATTRS
+    if _ATTRS is None:
+        try:
+            with gzip.open(MAP / "attrs.json.gz", "rt") as handle:
+                data = json.load(handle)
+            data["import"] = set(data["import"])
+            data["_masks"] = {}
+            prefixes = {}
+            for key in data["reads"]:
+                parts = key.split("|")
+                prefixes.setdefault(parts[0] + "|" + parts[1], []).append(key)
+            data["_prefix"] = prefixes
+            iprefixes = set()
+            for key in data["import"]:
+                parts = key.split("|")
+                iprefixes.add(parts[0] + "|" + parts[1])
+            data["_iprefix"] = iprefixes
+            _ATTRS = data
+        except Exception as error:
+            print(f"attribute map unavailable: {error}", file=sys.stderr)
+            _ATTRS = {}
+    return _ATTRS
+
+
+def _reads_mask(key):
+    data = _attrs()
+    cache = data["_masks"]
+    if key not in cache:
+        index = data["reads"].get(key)
+        cache[key] = to_mask(data["sets"][index]) if index is not None else 0
+    return cache[key]
+
+
+def hook_names():
+    """Attribute names a class-creation hook reads from the class being created (or from its
+    nested tokenizer). Those reads happen before the module is instrumented, so they are not
+    in the traced import reads. Expression.__init_subclass__ (arg_types -> required_args) is
+    handled separately in attr_selection."""
+    global _HOOK_NAMES
+    if _HOOK_NAMES is None:
+        names = set()
+        own = {"cls", "klass", "mcs"}
+        for path in scan_files():
+            if not path.startswith("sqlglot/"):
+                continue
+            text = read_source(path)
+            if not text or ("__init_subclass__" not in text and "(type)" not in text):
+                continue
+            try:
+                tree = ast.parse(text)
+            except Exception:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                is_meta = any(isinstance(b, ast.Name) and b.id == "type" for b in node.bases)
+                for item in node.body:
+                    if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    if not (item.name == "__init_subclass__" or (is_meta and item.name in ("__new__", "__init__", "__call__"))):
+                        continue
+                    body_names = set()
+                    for sub in ast.walk(item):
+                        if isinstance(sub, ast.Attribute):
+                            base = sub.value
+                            if isinstance(base, ast.Name) and base.id in own:
+                                body_names.add(sub.attr)
+                            elif isinstance(base, ast.Attribute) and base.attr in ("tokenizer_class", "jsonpath_tokenizer_class"):
+                                body_names.add(sub.attr)
+                        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.isidentifier() and sub.value.isupper():
+                            body_names.add(sub.value)
+                    body_names.discard("arg_types")
+                    names |= body_names
+        _HOOK_NAMES = names
+    return _HOOK_NAMES
+
+
+def _key_reprs(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return ["s:" + node.value]
+    if isinstance(node, ast.Attribute):
+        out = ["c:" + node.attr]
+        base = node.value
+        if isinstance(base, ast.Name):
+            out.append("e:" + base.id + "." + node.attr)
+        elif isinstance(base, ast.Attribute):
+            out.append("e:" + base.attr + "." + node.attr)
+        return out
+    if isinstance(node, ast.Name):
+        return ["c:" + node.id]
+    return None
+
+
+def _class_stmt(tree, line):
+    """(qualname, statement) of the class-body statement holding `line`, or None."""
+    def walk(body, prefix):
+        for stmt in body:
+            if not (stmt.lineno <= line <= stmt.end_lineno):
+                continue
+            if isinstance(stmt, ast.ClassDef):
+                qual = prefix + stmt.name
+                for inner in stmt.body:
+                    if inner.lineno <= line <= inner.end_lineno:
+                        if isinstance(inner, ast.ClassDef):
+                            return walk([inner], qual + ".")
+                        return (qual, inner)
+                return None
+            return None
+        return None
+
+    return walk(tree.body, "")
+
+
+def _assign_target(stmt):
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+        return stmt.targets[0].id, stmt.value
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+        return stmt.target.id, stmt.value
+    return None
+
+
+def _same_file_refs(tree, name, stmt, qual):
+    """Non-function code in this file, other than `stmt`, that loads this class's `name`:
+    a bare `name` inside the same class body, or `<Class>.name` anywhere."""
+    found = []
+    simple = qual.split(".")[-1]
+
+    def visit(node, cls_qual):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if child is stmt:
+                continue
+            if isinstance(child, ast.ClassDef):
+                visit(child, (cls_qual + "." if cls_qual else "") + child.name)
+                continue
+            if isinstance(child, ast.Name) and child.id == name and isinstance(child.ctx, ast.Load) and cls_qual == qual:
+                found.append(child)
+            elif isinstance(child, ast.Attribute) and child.attr == name and isinstance(child.ctx, ast.Load):
+                base = child.value
+                base_name = base.id if isinstance(base, ast.Name) else base.attr if isinstance(base, ast.Attribute) else None
+                if base_name in (simple, "cls", "self") or base_name is None:
+                    found.append(child)
+            visit(child, cls_qual)
+
+    visit(tree, "")
+    return found
+
+
+def _in_new_trie(tree, refs):
+    """True if every reference sits inside a new_trie(...) call (which only reads keys)."""
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", "")) == "new_trie"]
+    for ref in refs:
+        if not any(c.lineno <= ref.lineno <= c.end_lineno and c.col_offset <= ref.col_offset for c in calls):
+            return False
+    return True
+
+
+def attr_selection(path, line, hunks):
+    """Precise selection for a change to a class-body attribute, from traced attribute reads.
+
+    Returns a test mask, or None when the change is not a plain class attribute (or the
+    attribute feeds import-time work), in which case the caller uses the wider rules.
+    """
+    if enclosing_func(path, line):
+        return None
+    data = _attrs()
+    if not data:
+        return None
+    text = read_source(path)
+    old_tree = base_tree(path)
+    if old_tree is None:
+        return None
+    try:
+        new_tree = ast.parse(patched_text(text, hunks))
+    except Exception:
+        return None
+    found = _class_stmt(old_tree, line)
+    if not found:
+        return None
+    qual, stmt = found
+    target = _assign_target(stmt)
+    if not target:
+        return None
+    name, old_value = target
+    if name.startswith("__") or name in hook_names():
+        return None
+    owner = path + ":" + qual
+    # the same attribute in the patched file
+    new_value = None
+    for cand_qual, cand in _class_stmts(new_tree):
+        if cand_qual == qual:
+            t = _assign_target(cand)
+            if t and t[0] == name:
+                new_value = t[1]
+                break
+    if new_value is None:
+        return None
+    refs = _same_file_refs(old_tree, name, stmt, qual)
+    value_only_keys = None
+    if isinstance(old_value, ast.Dict) and isinstance(new_value, ast.Dict) and len(old_value.keys) == len(new_value.keys):
+        keys_same = all(
+            (a is None and b is None) or (a is not None and b is not None and ast.dump(a) == ast.dump(b))
+            for a, b in zip(old_value.keys, new_value.keys)
+        )
+        if keys_same:
+            changed = []
+            for k, a, b in zip(old_value.keys, old_value.values, new_value.values):
+                if ast.dump(a) != ast.dump(b):
+                    if k is None:
+                        changed = None
+                        break
+                    reprs = _key_reprs(k)
+                    if reprs is None:
+                        changed = None
+                        break
+                    changed.append(reprs)
+            value_only_keys = changed
+    if refs and not (value_only_keys is not None and _in_new_trie(old_tree, refs)):
+        return None
+    imports = data["import"]
+    mask = 0
+    if name == "arg_types":
+        # Expression.__init_subclass__ derives required_args from arg_types in every subclass
+        family = {owner} | set(data.get("subclasses", {}).get(owner, []))
+        for o in family:
+            if (o + "|required_args") in data["_iprefix"]:
+                return None
+            for key in data["_prefix"].get(o + "|required_args", []):
+                mask |= _reads_mask(key)
+        if value_only_keys is None:
+            for o in family:
+                if (o + "|arg_types") in data["_iprefix"]:
+                    return None
+                for key in data["_prefix"].get(o + "|arg_types", []):
+                    mask |= _reads_mask(key)
+            return mask
+    if value_only_keys is None:
+        # whole value changes: anything that read the attribute, unless import-time work read it
+        if (owner + "|" + name) in data["_iprefix"]:
+            return None
+        for key in data["_prefix"].get(owner + "|" + name, []):
+            mask |= _reads_mask(key)
+        return mask
+    for reprs in value_only_keys:
+        owners = {owner}
+        captured = False
+        for r in reprs:
+            for group in data["copies"].get(name + "|" + r, []):
+                if owner in group:
+                    owners.update(group)
+                    captured = True
+        for o in owners:
+            if (o + "|" + name + "|*v") in imports and not captured:
+                return None
+            for r in reprs:
+                if (o + "|" + name + "|" + r) in imports and not captured:
+                    return None
+                mask |= _reads_mask(o + "|" + name + "|" + r)
+            mask |= _reads_mask(o + "|" + name + "|*v")
+    return mask
+
+
+def _class_stmts(tree):
+    out = []
+
+    def walk(body, prefix):
+        for stmt in body:
+            if isinstance(stmt, ast.ClassDef):
+                qual = prefix + stmt.name
+                for inner in stmt.body:
+                    if isinstance(inner, ast.ClassDef):
+                        walk([inner], qual + ".")
+                    else:
+                        out.append((qual, inner))
+
+    walk(tree.body, "")
+    return out
+
+
+EQ_MODE = os.environ.get("EQ_MODE", "1") == "1"
+_EQ = None
+
+
+def _eq_profile():
+    global _EQ
+    if _EQ is None:
+        try:
+            _EQ = json.loads((MAP / "eqprofile.json").read_text())
+        except Exception:
+            _EQ = {}
+    return _EQ
+
+
+def _swap_diff(a, b, sites):
+    """True if trees a and b differ only by `is`->`==` / `is not`->`!=` in single comparisons."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        for field in a._fields:
+            va, vb = getattr(a, field, None), getattr(b, field, None)
+            if field == "ops" and isinstance(a, ast.Compare):
+                if len(va) != len(vb):
+                    return False
+                for oa, ob in zip(va, vb):
+                    if type(oa) is type(ob):
+                        continue
+                    if len(va) == 1 and (
+                        (isinstance(oa, ast.Is) and isinstance(ob, ast.Eq))
+                        or (isinstance(oa, ast.IsNot) and isinstance(ob, ast.NotEq))
+                    ):
+                        sites.append((a.lineno, a.col_offset))
+                    else:
+                        return False
+                continue
+            if not _swap_diff(va, vb, sites):
+                return False
+        return True
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_swap_diff(x, y, sites) for x, y in zip(a, b))
+    return a == b
+
+
+def identity_swap_equivalent(path, hunks):
+    """A patch that only turns identity comparisons into equality comparisons, at sites where
+    the equality-semantics profile saw `is` and `==` agree on every evaluation, cannot change
+    any execution the tests make."""
+    profile = _eq_profile()
+    if not profile:
+        return False
+    old = base_tree(path)
+    if old is None:
+        return False
+    try:
+        new = ast.parse(patched_text(read_source(path), hunks))
+    except Exception:
+        return False
+    sites = []
+    if not _swap_diff(old, new, sites) or not sites:
+        return False
+    for line, col in sites:
+        entry = profile.get(f"{path}:{line}:{col}")
+        if entry is None:
+            if line_mask(path, line) or run_range_mask(path, line, line):
+                return False
+        elif entry[1]:
+            return False
+    return True
+
+
 def escalate(path, anchor, chosen):
     func = enclosing_func(path, anchor)
     if func:
@@ -920,6 +1297,7 @@ def select_hunks(path, meta):
         added = hunk["added"]
         chosen = 0
         intentional = False
+        undecided = not hunk["changed_old"]
         if hunk["changed_old"]:
             control = any(COND_RE.search(line) for line in added)
             for line in hunk["changed_old"]:
@@ -929,6 +1307,7 @@ def select_hunks(path, meta):
                     continue
                 func = enclosing_func(path, line)
                 if func:
+                    undecided = True
                     span = stmt_span(path, line) if (STMT_MODE and line > func[2]) else None
                     if span is not None:
                         chosen |= range_mask(path, span[0], span[1])
@@ -939,6 +1318,12 @@ def select_hunks(path, meta):
                     else:
                         chosen |= line_mask(path, line)
                     continue
+                if ATTR_MODE:
+                    precise = attr_selection(path, line, meta["hunks"])
+                    if precise is not None:
+                        chosen |= precise
+                        continue
+                undecided = True
                 assign = enclosing_class_assign(path, line)
                 if CLASS_MODE and enclosing_class(path, line):
                     usage = class_usage(path, line)
@@ -1034,7 +1419,7 @@ def select_hunks(path, meta):
                         if symbol:
                             refs = symbol_tests(symbol)
                             chosen |= refs if popcount(refs) <= SYMBOL_CAP else ALL
-        if not chosen and not intentional:
+        if not chosen and not intentional and undecided:
             anchor = hunk["changed_old"][0] if hunk["changed_old"] else max(1, (hunk["insert_at"][0] if hunk["insert_at"] else 1))
             chosen = escalate(path, anchor, chosen)
         selected |= chosen
@@ -1098,6 +1483,8 @@ def select(files):
             selected |= ALL
             continue
         if AST_EQ_MODE and ast_equivalent(path, meta["hunks"]):
+            continue
+        if EQ_MODE and identity_swap_equivalent(path, meta["hunks"]):
             continue
         if get_blocks(path) is None:
             selected |= ALL

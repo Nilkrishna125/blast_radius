@@ -1,5 +1,6 @@
 #!/bin/sh
-# Rebuilds map/run.json.gz, map/classes.json and map/fixture_readers.json from the pinned
+# Rebuilds map/run.json.gz, map/classes.json, map/fixture_readers.json, map/attrs.json.gz and
+# map/eqprofile.json from the pinned
 # sqlglot commit. Run once on a dev machine (takes ~3 min on 10 cores); the outputs are committed.
 #   docker build -t br-env - < tools/env.Dockerfile   (python:3.13-slim + requirements.lock)
 #   tools/build_maps.sh /path/to/sqlglot-at-eb11aec
@@ -14,6 +15,17 @@ docker run --rm --memory 2g -v "$SRC":/work:ro -v "$WORK":/iso -w /work br-env p
 python3 "$WORK/export_run.py" "$WORK/tests.json" "$WORK/trace" "$WORK/out"
 python3 "$WORK/export_classes.py" "$WORK/tests.json" "$WORK/trace" "$WORK/mro.json" "$SRC" "$HERE/map/classes.json"
 cp "$WORK/out/run.json.gz" "$HERE/map/"
+# class-attribute reads per test
+mkdir -p "$WORK/attrs"
+docker run --rm --memory 5g --cpuset-cpus 0-9 -v "$SRC":/work:ro -v "$WORK":/iso -w /work br-env \
+  python /iso/trace_attrs.py /iso/tests.json /iso/attrs 10
+python3 "$WORK/export_attrs.py" "$WORK/tests.json" "$WORK/attrs" "$HERE/map/attrs.json.gz" "$WORK/mro.json" "$SRC"
+# equality-semantics profile of `is` / `is not` sites (one full pytest run)
+mkdir -p "$WORK/eq"
+docker run --rm --memory 8g --cpuset-cpus 0-9 -v "$SRC":/work:ro -v "$HERE/tools/eqprofile":/eqp:ro -v "$WORK":/eq -w /work \
+  -e SKIP_INTEGRATION=0 -e PYTHONPATH=/eqp:/work -e EQ_ROOT=/work -e EQ_OUT=/eq/eq br-env \
+  python -m pytest -q -n 8 -p eqplug -p no:cacheprovider tests
+python3 "$HERE/tools/export_eq.py" "$WORK/eq" "$HERE/map/eqprofile.json"
 python3 - "$WORK/out/fixture_files.json" "$HERE/map/fixture_readers.json" <<'PY'
 import json, os, sys
 r = {}

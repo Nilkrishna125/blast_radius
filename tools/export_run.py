@@ -14,6 +14,8 @@ for p in glob.glob(sys.argv[2] + "/*.json"):
 OUTDIR = sys.argv[3]; os.makedirs(OUTDIR, exist_ok=True)
 for name, M in (("run", run), ("def", dfn)):
     out = {f: {l: sorted(v) for l, v in sorted(d.items(), key=lambda x: int(x[0]))} for f, d in sorted(M.items())}
+    # values stay JSON strings so the selector only decodes the files it needs
+    out = {f: json.dumps(v, separators=(",", ":")) for f, v in out.items()}
     with gzip.open(f"{OUTDIR}/{name}.json.gz", "wt", compresslevel=9) as h: json.dump(out, h, separators=(",", ":"))
     print(name, os.path.getsize(f"{OUTDIR}/{name}.json.gz"))
 json.dump({k: sorted(v) for k, v in fx.items()}, open(OUTDIR + "/fixture_files.json", "w"))
