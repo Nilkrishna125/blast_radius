@@ -26,6 +26,20 @@ docker run --rm --memory 8g --cpuset-cpus 0-9 -v "$SRC":/work:ro -v "$HERE/tools
   -e SKIP_INTEGRATION=0 -e PYTHONPATH=/eqp:/work -e EQ_ROOT=/work -e EQ_OUT=/eq/eq br-env \
   python -m pytest -q -n 8 -p eqplug -p no:cacheprovider tests
 python3 "$HERE/tools/export_eq.py" "$WORK/eq" "$HERE/map/eqprofile.json"
+# per-query TPC map (map/tpc.json.gz); map/state.json is built inside the image (Dockerfile)
+docker run --rm --memory 6g --cpuset-cpus 0-9 -v "$SRC":/work:ro -v "$WORK":/iso -w /work br-env python -W ignore /iso/trace_tpcds.py /iso/tpc.json
+python3 - "$WORK/tpc.json" "$HERE/map/tpc.json.gz" <<'PY'
+import gzip, json, sys
+d = json.load(open(sys.argv[1])); ex = {}
+for q in d["tpcds"]:
+    for f, ls in q["exec"].items():
+        ex.setdefault(f, set()).update(ls)
+out = {"setup": d["setup"], "exec": {f: sorted(v) for f, v in ex.items()},
+       "tpcds": [{k: q.get(k) for k in ("i", "execute", "sql", "fp", "duck_sql", "front")} for q in d["tpcds"]],
+       "tpch": d["tpch"]}
+with gzip.open(sys.argv[2], "wt", compresslevel=9) as h:
+    json.dump(out, h, separators=(",", ":"))
+PY
 python3 - "$WORK/out/fixture_files.json" "$HERE/map/fixture_readers.json" <<'PY'
 import json, os, sys
 r = {}

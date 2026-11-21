@@ -1,6 +1,6 @@
 # Blast Radius
 
-A selector for the Blast Radius track. It uses coverage maps built from the pinned sqlglot commit, plus AST and fixture analysis, to run only the tests a patch can reach. On the 30 sample commits it scores 118.642 s simulated with 0 misses, and 0 misses on 147 synthetic mutants checked against a full test run.
+A selector for the Blast Radius track. It uses coverage maps built from the pinned sqlglot commit, plus AST and fixture analysis, to run only the tests a patch can reach. On the 30 sample commits it scores 99.176 s simulated (oracle 94.351) with 0 misses, and 0 misses on 147 synthetic mutants checked against a full test run.
 
 ## Approach
 
@@ -13,6 +13,9 @@ A selector for the Blast Radius track. It uses coverage maps built from the pinn
 - `base/` is the pinned sqlglot source and tests, used for AST and symbol-reference analysis at run time.
 - `selector.py` selects, per changed statement, the tests that ran it. Files whose AST is unchanged (comment-only edits) select nothing. Imports, deletions, renames, syntax errors and unresolved cases fall back to conservative selections.
 - Selected tests are scheduled longest-first, choosing the worker count that minimizes `busiest worker + 2 s per worker`.
+- Import-state diff (`state.py`): at image build the pinned sqlglot is imported in full and every module global and class attribute is fingerprinted (twice, to find values that differ between runs of the same code). For a patch that touches code outside function bodies, a forked child imports the patched sqlglot the same way, and the keys whose fingerprint changed (including attributes derived at class creation, such as tokenizer tries) select their readers from `map/attrs.json.gz`.
+- Heavy executor tests (`verify.py`, `map/tpc.json.gz`): per TPC-DS query, the lines its front end (parse, transpile, optimizer) and its run phase (planner, Python executor, pickling) execute, the fingerprint of the optimized expression handed to the planner, and the pinned DuckDB transpiles. When a patch touches nothing the run phase executes, a child recomputes the front-end outputs of the affected queries on the patched code; if they all match, `test_execute_tpcds`, `test_execute_tpch` and `test_optimized_tpch` cannot change. `test_max_nodes` is checked with the same assertions on a 1/50-width statement.
+- Cheap selections (at most 1.5 s of recorded time, no DuckDB-dependent tests) are run on the patched code in a forked child and only the failing tests are kept.
 - `tools/` rebuilds `run.json.gz`, `classes.json` and `fixture_readers.json` from a sqlglot checkout (`tools/build_maps.sh`). Not part of the image.
 
 ## Credits

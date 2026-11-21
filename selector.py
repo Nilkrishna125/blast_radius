@@ -302,6 +302,8 @@ class IndexFile:
 # ----------------------------------------------------------------------------
 
 DUR_MS = {}
+ID_NUM = {}
+NUM_ID = {}
 ALL = 0
 TEST_FILES = set()
 FILE_MASK = {}
@@ -336,6 +338,10 @@ def init():
         if len(parts) >= 2:
             by_method.setdefault((parts[0], parts[-1].split("[")[0]), []).append(number)
     ALL = to_mask(DUR_MS)
+    ID_NUM.clear()
+    ID_NUM.update({test["id"]: test["number"] for test in tests})
+    NUM_ID.clear()
+    NUM_ID.update({test["number"]: test["id"] for test in tests})
     TEST_FILES = set(by_file)
     FILE_MASK = {key: to_mask(value) for key, value in by_file.items()}
     METHOD_MASK = {key: to_mask(value) for key, value in by_method.items()}
@@ -1269,6 +1275,113 @@ def identity_swap_equivalent(path, hunks):
     return True
 
 
+
+_OWNERS = None
+
+
+def _traced_owners():
+    global _OWNERS
+    if _OWNERS is None:
+        data = _attrs()
+        _OWNERS = {k.split("|", 1)[0] for k in data.get("reads", {})} if data else set()
+    return _OWNERS
+
+
+def _class_mask(owner):
+    global _CLASSMAP
+    if _CLASSMAP is None:
+        try:
+            _CLASSMAP = json.loads((MAP / "classes.json").read_text())
+        except Exception:
+            _CLASSMAP = {}
+    value = _CLASSMAP.get(owner)
+    return to_mask(value) if value else 0
+
+
+def _function_body(path, qual, name):
+    """(body_start, end) of def `name` in class `qual` (or at module level), or None."""
+    tree = base_tree(path)
+    if tree is None:
+        return None
+    body = tree.body
+    if qual:
+        for part in qual.split("."):
+            nxt = None
+            for node in body:
+                if isinstance(node, ast.ClassDef) and node.name == part:
+                    nxt = node.body
+                    break
+            if nxt is None:
+                return None
+            body = nxt
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name and node.body:
+            return node.body[0].lineno, node.end_lineno
+    return None
+
+
+def diff_selection(info):
+    """Tests that can observe the import-time state a patch changes (see state.py)."""
+    data = _attrs()
+    changed = info["changed"]
+    added, removed = set(info["added"]), set(info["removed"])
+    keyed = {k.rsplit("|", 1)[0] for k in changed if k.count("|") >= 2}
+    owners = _traced_owners()
+    mask = 0
+    for key in changed:
+        owner, rest = key.split("|", 1)
+        parts = rest.split("|", 1)
+        attr, sub = parts[0], (parts[1] if len(parts) > 1 else None)
+        if ":" in owner:
+            path, qual = owner.split(":", 1)
+            base_owner = owner.split(".<", 1)[0]
+            if attr == "__methods__":
+                mask |= _class_mask(base_owner) | symbol_tests(qual.split(".")[-1])
+                continue
+            if sub == "__defaults__":
+                span = _function_body(path, qual, attr) if ".<" not in owner else None
+                if span:
+                    mask |= run_range_mask(path, *span) | range_mask(path, *span)
+                else:
+                    mask |= _class_mask(base_owner)
+                continue
+            if ".<" in owner or owner not in owners:
+                # not instrumented (dialect-built classes, enums): every user of the class
+                mask |= _class_mask(base_owner) | symbol_tests(attr)
+                continue
+            if sub is not None:
+                mask |= _reads_mask(owner + "|" + attr + "|" + sub) | _reads_mask(owner + "|" + attr + "|*v")
+                if key in added or key in removed:
+                    mask |= _reads_mask(owner + "|" + attr + "|*k")
+                continue
+            mask |= _reads_mask(owner + "|" + attr)
+            if (owner + "|" + attr) not in keyed:
+                for k in data["_prefix"].get(owner + "|" + attr, []):
+                    mask |= _reads_mask(k)
+        else:
+            path = owner
+            if attr == "__names__":
+                mask |= module_mask(path) | run_module_mask(path)
+                continue
+            if sub == "__defaults__":
+                span = _function_body(path, "", attr)
+                if span:
+                    mask |= run_range_mask(path, *span) | range_mask(path, *span)
+                else:
+                    mask |= module_mask(path)
+                continue
+            refs = symbol_tests(attr)
+            mask |= refs if refs else 0
+    return mask
+
+
+def run_module_mask(path):
+    found = 0
+    for numbers in _run_file(path).values():
+        found |= to_mask(numbers)
+    return found
+
+
 def escalate(path, anchor, chosen):
     func = enclosing_func(path, anchor)
     if func:
@@ -1286,7 +1399,7 @@ def escalate(path, anchor, chosen):
     return chosen
 
 
-def select_hunks(path, meta):
+def select_hunks(path, meta, diff_mode=False):
     selected = 0
     source = source_lines(path)
 
@@ -1302,6 +1415,14 @@ def select_hunks(path, meta):
             control = any(COND_RE.search(line) for line in added)
             for line in hunk["changed_old"]:
                 current = text(line)
+                if diff_mode:
+                    func = enclosing_func(path, line)
+                    if not func:
+                        continue  # module/class level: decided by the import-state diff
+                    if line <= func[2]:
+                        # def / decorator header: the code (or defaults) of this function changed
+                        chosen |= run_range_mask(path, func[2], func[1]) | range_mask(path, func[2], func[1])
+                        continue
                 if DEF_RE.match(current) or IMPORT_RE.match(current):
                     chosen |= ALL
                     continue
@@ -1368,6 +1489,15 @@ def select_hunks(path, meta):
             intentional = cosmetic and module_level and not pos_sensitive(path)
             for insert_line in runs:
                 line = max(1, insert_line - 1)
+                if diff_mode and not cosmetic:
+                    func = enclosing_func(path, line)
+                    if not func or enclosing_func(path, insert_line) != func:
+                        if any(DEF_RE.match(item) for item in added) or not func:
+                            undecided = False
+                            continue  # new module/class-level code: decided by the diff
+                    elif line < func[2]:
+                        chosen |= run_range_mask(path, func[2], func[1]) | range_mask(path, func[2], func[1])
+                        continue
                 if cosmetic:
                     func = enclosing_func(path, line)
                     cls = enclosing_class(path, line)
@@ -1419,15 +1549,62 @@ def select_hunks(path, meta):
                         if symbol:
                             refs = symbol_tests(symbol)
                             chosen |= refs if popcount(refs) <= SYMBOL_CAP else ALL
-        if not chosen and not intentional and undecided:
+        if diff_mode and not undecided:
+            pass
+        elif not chosen and not intentional and undecided:
             anchor = hunk["changed_old"][0] if hunk["changed_old"] else max(1, (hunk["insert_at"][0] if hunk["insert_at"] else 1))
             chosen = escalate(path, anchor, chosen)
         selected |= chosen
     return selected
 
 
+DIFF_MODE = os.environ.get("DIFF_MODE", "1") == "1"
+
+
+def _needs_diff(path, meta):
+    """True if the patch touches this sqlglot file outside function bodies (module or class
+    level, or a def/decorator header)."""
+    for hunk in meta["hunks"]:
+        lines = list(hunk["changed_old"]) or [max(1, at - 1) for at in hunk["insert_at"]]
+        for line in lines:
+            func = enclosing_func(path, line)
+            if not func or line <= func[2]:
+                return True
+        if not hunk["changed_old"] and any(DEF_RE.match(item) for item in hunk["added"]):
+            return True
+    return False
+
+
+def _patched_sqlglot(files):
+    patched = {}
+    for path, meta in files.items():
+        if meta["new"] or meta["deleted"] or meta["rename"] or meta["binary"]:
+            continue
+        if path.startswith("sqlglot/") and path.endswith(".py") and read_source(path) is not None:
+            patched[path] = patched_text(read_source(path), meta["hunks"])
+    return patched
+
+
 def select(files):
     selected = 0
+    diff_files = set()
+    if DIFF_MODE:
+        wanted = [
+            path for path, meta in files.items()
+            if path.startswith("sqlglot/") and path.endswith(".py") and path != "sqlglot/__init__.py"
+            and not (meta["new"] or meta["deleted"] or meta["rename"] or meta["binary"])
+            and syntax_ok(path, meta["hunks"]) and get_blocks(path) is not None
+            and not (AST_EQ_MODE and ast_equivalent(path, meta["hunks"]))
+            and not (EQ_MODE and identity_swap_equivalent(path, meta["hunks"]))
+            and _needs_diff(path, meta)
+        ]
+        if wanted and time.monotonic() - START < BUDGET_SECONDS - 20:
+            import verify
+            info = verify.state_diff(str(BASE), str(MAP / "state.json"), _patched_sqlglot(files))
+            if info is not None:
+                diff_files = set(wanted)
+                selected |= diff_selection(info)
+                print(f"state diff: {len(info['changed'])} keys", file=sys.stderr)
     for path, meta in files.items():
         if meta["rename"] or meta["binary"]:
             selected |= ALL
@@ -1489,7 +1666,7 @@ def select(files):
         if get_blocks(path) is None:
             selected |= ALL
             continue
-        selected |= select_hunks(path, meta)
+        selected |= select_hunks(path, meta, diff_mode=path in diff_files)
     return selected
 
 
@@ -1564,14 +1741,173 @@ def answer(patch):
     if time.monotonic() - START > BUDGET_SECONDS:
         return conservative(files)
     try:
-        return select(files)
+        mask = select(files)
     except Exception as error:
         print(f"{patch.name}: {error!r}; using conservative answer", file=sys.stderr)
         return conservative(files)
+    if HEAVY_MODE:
+        try:
+            mask = refine_heavy(files, mask)
+        except Exception as error:
+            print(f"{patch.name}: heavy check failed: {error!r}", file=sys.stderr)
+    if CHEAP_MODE and mask:
+        try:
+            mask = verify_cheap(files, mask)
+        except Exception as error:
+            print(f"{patch.name}: cheap check failed: {error!r}", file=sys.stderr)
+    return mask
+
+
+CHEAP_MODE = os.environ.get("CHEAP_MODE", "1") == "1"
+CHEAP_MAX_MS = int(os.environ.get("CHEAP_MAX_MS", "1500"))
+CHEAP_MAX_TESTS = 40
+# Files whose tests need DuckDB/pandas (not in the image), and tests whose outcome depends on
+# memory or process state rather than on the code: never decided by running them here.
+CHEAP_SKIP_FILES = {"tests/test_executor.py", "tests/test_optimizer.py"}
+CHEAP_SKIP_WORDS = ("memory", "leak", "retain", "lazy_load", "sqlglotc", "integration")
+
+
+def verify_cheap(files, mask):
+    """Run a small, cheap selection on the patched code and keep only the tests that fail."""
+    for path, meta in files.items():
+        if meta["new"] or meta["deleted"] or meta["rename"] or meta["binary"]:
+            return mask
+        if not (path.startswith("sqlglot/") and path.endswith(".py")):
+            return mask
+    numbers = mask_to_numbers(mask)
+    if len(numbers) > CHEAP_MAX_TESTS:
+        return mask
+    total = sum(DUR_MS.get(n, 0) for n in numbers)
+    if total > CHEAP_MAX_MS:
+        return mask
+    ids = []
+    for n in numbers:
+        test_id = NUM_ID.get(n)
+        if test_id is None or test_id.split("::")[0] in CHEAP_SKIP_FILES:
+            return mask
+        if any(word in test_id.lower() for word in CHEAP_SKIP_WORDS):
+            return mask
+        ids.append(test_id)
+    if time.monotonic() - START > BUDGET_SECONDS - 15:
+        return mask
+    patched = _patched_sqlglot(files)
+    for path, text in patched.items():
+        try:
+            compile(text, path, "exec", ast.PyCF_ONLY_AST)
+        except Exception:
+            return mask
+    import verify
+    failing = verify.run_tests(str(BASE), patched, ids, seconds=10 + 5 * total / 1000)
+    if failing is None:
+        return mask
+    kept = 0
+    for test_id in failing:
+        number = ID_NUM.get(test_id)
+        if number is not None and (mask >> number) & 1:
+            kept |= 1 << number
+    print(f"cheap check: ran {len(ids)} tests ({total} ms), {len(failing)} failing", file=sys.stderr)
+    return kept
+
+
+HEAVY_MODE = os.environ.get("HEAVY_MODE", "1") == "1"
+
+
+def touched_lines(path, hunks):
+    """Old line numbers a patch touches, widened to whole statements: the statement for a
+    line in a function body, the whole module- or class-level statement otherwise."""
+    lines = set()
+    raw = set()
+    for hunk in hunks:
+        raw.update(hunk["changed_old"])
+        for at in hunk["insert_at"]:
+            raw.update((max(1, at - 1), at))
+    tree = base_tree(path)
+    for line in raw:
+        lines.add(line)
+        func = enclosing_func(path, line)
+        if func and line > func[2]:
+            span = stmt_span(path, line)
+            if span:
+                lines.update(range(span[0], span[1] + 1))
+            continue
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.stmt) and not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.lineno <= line <= node.end_lineno and not enclosing_func(path, node.lineno):
+                        lines.update(range(node.lineno, node.end_lineno + 1))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    head_end = node.body[0].lineno - 1 if node.body else node.end_lineno
+                    start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                    if start <= line <= max(head_end, node.lineno):
+                        lines.update(range(start, max(head_end, node.lineno) + 1))
+    return lines
+
+
+def refine_heavy(files, mask):
+    """Drop heavy tests that decision-time checks on the patched code prove cannot fail."""
+    import verify
+    heavy = {}
+    for test_id in (verify.TPCDS, verify.TPCH, verify.OPT_TPCH, verify.MAX_NODES):
+        number = ID_NUM.get(test_id)
+        if number is not None and (mask >> number) & 1:
+            heavy[test_id] = number
+    if not heavy:
+        return mask
+    if time.monotonic() - START > BUDGET_SECONDS - 15:
+        return mask
+    patched, touched = {}, {}
+    for path, meta in files.items():
+        if meta["new"] or meta["deleted"] or meta["rename"] or meta["binary"]:
+            return mask
+        if not (path.startswith("sqlglot/") and path.endswith(".py")):
+            return mask
+        text = read_source(path)
+        if text is None:
+            return mask
+        new_text = patched_text(text, meta["hunks"])
+        try:
+            compile(new_text, path, "exec", ast.PyCF_ONLY_AST)
+        except Exception:
+            return mask
+        patched[path] = new_text
+        touched[path] = touched_lines(path, meta["hunks"])
+    data = verify.tpc_map(str(MAP))
+    # TestExecutor.setUpClass builds executor Tables: a touched line that ran during import or
+    # setup in a function body, or in a module the executor's run phase uses, can break every
+    # TestExecutor test, so those keep their tests.
+    setup_risk = not data
+    for path, lines in touched.items():
+        if not data:
+            break
+        hit = lines & data["setup"].get(path, set())
+        if hit and (path in data["exec"] or any(enclosing_func(path, line) for line in hit)):
+            setup_risk = True
+    checks = {}
+    for test_id in heavy:
+        if test_id != verify.MAX_NODES and setup_risk:
+            continue
+        if test_id == verify.TPCDS:
+            action, queries = verify.plan_tpcds(data, touched)
+            if action == "drop":
+                mask &= ~(1 << heavy[test_id])
+            elif action == "check":
+                checks[test_id] = queries
+        elif test_id == verify.TPCH:
+            if data and not any(lines & data["exec"].get(path, set()) for path, lines in touched.items()):
+                checks[test_id] = None
+        elif data or test_id == verify.MAX_NODES:
+            checks[test_id] = None
+    if checks:
+        safe = verify.run_checks(str(BASE), str(MAP), patched, checks)
+        for test_id in safe:
+            mask &= ~(1 << heavy[test_id])
+        print(f"heavy checks {sorted(t.split('::')[-1] for t in checks)} safe {sorted(t.split('::')[-1] for t in safe)}", file=sys.stderr)
+    return mask
 
 
 def main():
     gc.disable()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     patches = sorted((DATA / "commits").glob("*.patch"))
     try:
         init()
