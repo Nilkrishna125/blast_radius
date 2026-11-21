@@ -1,14 +1,17 @@
 # Blast Radius
 
-A selector for the Blast Radius track. It uses a per-test line-coverage map built from the pinned sqlglot commit, plus AST and fixture analysis, to run only the tests a patch can reach. On the 30 sample commits it scores 189.753 s simulated with 0 misses.
+A selector for the Blast Radius track. It uses coverage maps built from the pinned sqlglot commit, plus AST and fixture analysis, to run only the tests a patch can reach. On the 30 sample commits it scores 186.493 s simulated with 0 misses, and 0 misses on 89 synthetic mutants checked against a full test run.
 
 ## Approach
 
-- `map/inv.json.gz` maps each covered line of the pinned commit to the tests that executed it.
-- `map/fixtures.json` maps fixture stems to the test methods that load them.
-- `base/sqlglot` is the pinned sqlglot source, used for AST and symbol-reference analysis at run time.
-- `selector.py` classifies each changed line (function body, condition, class attribute, module level, fixture) and falls back to all tests for syntax errors, imports, deletions, renames, and unresolved cases.
+- `map/inv.json.gz`: per-line coverage from one shared pytest run.
+- `map/run.json.gz`: per-test *isolated* coverage (each test in its own forked process, traced with `sys.monitoring`), counting only lines run inside function code. Import-time work, cached functions and `setUpClass` are credited to every test that depends on them, not just the first one in a process.
+- `map/classes.json`: for each sqlglot class, the tests that instantiated it or a subclass, or called its classmethods. Class-body changes (Expression `arg_types`, dialect Tokenizer/Parser/Generator settings) use it, so inherited settings reach subclass dialects.
+- `map/fixtures.json` / `map/fixture_readers.json`: fixture stem to the tests that use its content, and to every test that opens the file (traced).
+- `base/` is the pinned sqlglot source and tests, used for AST and symbol-reference analysis at run time.
+- `selector.py` selects, per changed statement, the tests that ran it. Files whose AST is unchanged (comment-only edits) select nothing. Imports, deletions, renames, syntax errors and unresolved cases fall back to conservative selections.
 - Selected tests are scheduled longest-first, choosing the worker count that minimizes `busiest worker + 2 s per worker`.
+- `tools/` rebuilds `run.json.gz`, `classes.json` and `fixture_readers.json` from a sqlglot checkout (`tools/build_maps.sh`). Not part of the image.
 
 ## Credits
 

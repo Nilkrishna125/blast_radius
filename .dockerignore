@@ -3,3 +3,4 @@ output.jsonl
 .git
 __pycache__
 *.pyc
+tools
