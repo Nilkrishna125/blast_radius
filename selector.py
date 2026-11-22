@@ -1235,8 +1235,9 @@ def _swap_diff(a, b, sites):
                     if len(va) == 1 and (
                         (isinstance(oa, ast.Is) and isinstance(ob, ast.Eq))
                         or (isinstance(oa, ast.IsNot) and isinstance(ob, ast.NotEq))
+                        or (ORDER_SWAPS and _order_swap(oa, ob))
                     ):
-                        sites.append((a.lineno, a.col_offset))
+                        sites.append((a.lineno, a.col_offset, type(oa).__name__))
                     else:
                         return False
                 continue
@@ -1246,6 +1247,55 @@ def _swap_diff(a, b, sites):
     if isinstance(a, list):
         return len(a) == len(b) and all(_swap_diff(x, y, sites) for x, y in zip(a, b))
     return a == b
+
+
+ORDER_SWAPS = False  # _swap_diff is shared: ordering swaps only count in swap_selection()
+
+
+def _order_swap(oa, ob):
+    pairs = ((ast.Lt, ast.LtE), (ast.LtE, ast.Lt), (ast.Gt, ast.GtE), (ast.GtE, ast.Gt))
+    return any(isinstance(oa, x) and isinstance(ob, y) for x, y in pairs)
+
+
+CMP_MODE = os.environ.get("CMP_MODE", "1") == "1"
+_CMP = None
+
+
+def swap_selection(path, hunks):
+    """For a patch that only swaps `is`/`==`, `is not`/`!=`, `<`/`<=` or `>`/`>=` at single
+    comparisons: the tests in which the swapped operator ever answered differently (per-test
+    comparison profile). None when the patch is something else or a site is not profiled."""
+    global _CMP, ORDER_SWAPS
+    if _CMP is None:
+        try:
+            _CMP = json.loads((MAP / "cmpprofile.json").read_text())
+        except Exception:
+            _CMP = {}
+    if not _CMP:
+        return None
+    old = base_tree(path)
+    if old is None:
+        return None
+    try:
+        new = ast.parse(patched_text(read_source(path), hunks))
+    except Exception:
+        return None
+    sites = []
+    ORDER_SWAPS = True
+    try:
+        same = _swap_diff(old, new, sites)
+    finally:
+        ORDER_SWAPS = False
+    if not same or not sites:
+        return None
+    mask = 0
+    for line, col, _ in sites:
+        entry = _CMP.get(f"{path}:{line}:{col}")
+        if entry == "*":
+            return None
+        if entry:
+            mask |= to_mask(entry)
+    return mask
 
 
 def identity_swap_equivalent(path, hunks):
@@ -1265,7 +1315,7 @@ def identity_swap_equivalent(path, hunks):
     sites = []
     if not _swap_diff(old, new, sites) or not sites:
         return False
-    for line, col in sites:
+    for line, col, _ in sites:
         entry = profile.get(f"{path}:{line}:{col}")
         if entry is None:
             if line_mask(path, line) or run_range_mask(path, line, line):
@@ -1585,7 +1635,11 @@ def _patched_sqlglot(files):
     return patched
 
 
+LAST_DIFF = {}
+
+
 def select(files):
+    LAST_DIFF.clear()
     selected = 0
     diff_files = set()
     if DIFF_MODE:
@@ -1601,10 +1655,11 @@ def select(files):
         if wanted and time.monotonic() - START < BUDGET_SECONDS - 20:
             import verify
             info = verify.state_diff(str(BASE), str(MAP / "state.json"), _patched_sqlglot(files))
+            LAST_DIFF["info"] = info
             if info is not None:
                 diff_files = set(wanted)
                 selected |= diff_selection(info)
-                print(f"state diff: {len(info['changed'])} keys", file=sys.stderr)
+                print(f"state diff: {len(info['changed'])} keys", info['changed'][:6] if DEBUG_HEAVY else "", file=sys.stderr)
     for path, meta in files.items():
         if meta["rename"] or meta["binary"]:
             selected |= ALL
@@ -1663,6 +1718,11 @@ def select(files):
             continue
         if EQ_MODE and identity_swap_equivalent(path, meta["hunks"]):
             continue
+        if CMP_MODE:
+            swapped = swap_selection(path, meta["hunks"])
+            if swapped is not None:
+                selected |= swapped
+                continue
         if get_blocks(path) is None:
             selected |= ALL
             continue
@@ -1810,6 +1870,7 @@ def verify_cheap(files, mask):
 
 
 HEAVY_MODE = os.environ.get("HEAVY_MODE", "1") == "1"
+DEBUG_HEAVY = os.environ.get("DEBUG_HEAVY") == "1"
 
 
 def touched_lines(path, hunks):
@@ -1825,6 +1886,9 @@ def touched_lines(path, hunks):
     for line in raw:
         lines.add(line)
         func = enclosing_func(path, line)
+        if func and func[3] == "<lambda>":
+            lines.update(range(func[0], func[1] + 1))  # just the lambda, not its statement
+            continue
         if func and line > func[2]:
             span = stmt_span(path, line)
             if span:
@@ -1843,11 +1907,50 @@ def touched_lines(path, hunks):
     return lines
 
 
+_TEST_READS = {}
+
+
+def test_read_prefixes(number):
+    """{"owner|attr"} of every class attribute test `number` read (traced)."""
+    if number not in _TEST_READS:
+        data = _attrs()
+        found = set()
+        if data:
+            hit_sets = {i for i, members in enumerate(data["sets"]) if number in members}
+            for key, idx in data["reads"].items():
+                if idx in hit_sets:
+                    parts = key.split("|")
+                    found.add(parts[0] + "|" + parts[1])
+        _TEST_READS[number] = found
+    return _TEST_READS[number]
+
+
+def diff_relevance(info, number):
+    """Files owning changed import-state keys that test `number` read, and files owning
+    changed keys whose readers are unknown (module globals, method sets, uninstrumented
+    classes)."""
+    reads = test_read_prefixes(number)
+    owners = _traced_owners()
+    read_files, unknown_files = set(), set()
+    for key in info["changed"]:
+        owner, rest = key.split("|", 1)
+        attr = rest.split("|", 1)[0]
+        sub = rest.split("|", 1)[1] if "|" in rest else None
+        if sub == "__defaults__":
+            continue  # handled as a change to the function body
+        path = owner.split(":", 1)[0]
+        if ":" not in owner or attr == "__methods__" or ".<" in owner or owner not in owners:
+            unknown_files.add(path)
+        elif (owner + "|" + attr) in reads:
+            read_files.add(path)
+    return read_files, unknown_files
+
+
 def refine_heavy(files, mask):
     """Drop heavy tests that decision-time checks on the patched code prove cannot fail."""
     import verify
     heavy = {}
-    for test_id in (verify.TPCDS, verify.TPCH, verify.OPT_TPCH, verify.MAX_NODES):
+    for test_id in (verify.TPCDS, verify.TPCH, verify.OPT_TPCH, verify.MAX_NODES, verify.GEN_MEMORY, verify.ANNOTATE_FUNCS):
         number = ID_NUM.get(test_id)
         if number is not None and (mask >> number) & 1:
             heavy[test_id] = number
@@ -1855,10 +1958,20 @@ def refine_heavy(files, mask):
         return mask
     if time.monotonic() - START > BUDGET_SECONDS - 15:
         return mask
-    patched, touched = {}, {}
+    patched, runtime, import_time = {}, {}, {}
     for path, meta in files.items():
         if meta["new"] or meta["deleted"] or meta["rename"] or meta["binary"]:
             return mask
+        if path.startswith("tests/fixtures/"):
+            # a heavy test that opens this fixture stays; the others are unaffected by it
+            readers = fixture_reader_mask(os.path.splitext(os.path.basename(path))[0])
+            if readers is None:
+                return mask
+            for test_id in [t for t, n in heavy.items() if (readers >> n) & 1]:
+                del heavy[test_id]
+            if not heavy:
+                return mask
+            continue
         if not (path.startswith("sqlglot/") and path.endswith(".py")):
             return mask
         text = read_source(path)
@@ -1870,38 +1983,83 @@ def refine_heavy(files, mask):
         except Exception:
             return mask
         patched[path] = new_text
-        touched[path] = touched_lines(path, meta["hunks"])
+        for line in touched_lines(path, meta["hunks"]):
+            func = enclosing_func(path, line)
+            if func and (line > func[2] or func[3] == "<lambda>"):
+                runtime.setdefault(path, set()).add(line)
+            else:
+                import_time.setdefault(path, set()).add(line)
+                if func:  # def / decorator header: the body's behaviour may change
+                    runtime.setdefault(path, set()).update(range(func[2], func[1] + 1))
     data = verify.tpc_map(str(MAP))
-    # TestExecutor.setUpClass builds executor Tables: a touched line that ran during import or
-    # setup in a function body, or in a module the executor's run phase uses, can break every
-    # TestExecutor test, so those keep their tests.
-    setup_risk = not data
-    for path, lines in touched.items():
-        if not data:
-            break
-        hit = lines & data["setup"].get(path, set())
-        if hit and (path in data["exec"] or any(enclosing_func(path, line) for line in hit)):
-            setup_risk = True
+    info = LAST_DIFF.get("info")
     checks = {}
-    for test_id in heavy:
-        if test_id != verify.MAX_NODES and setup_risk:
+    for test_id, number in heavy.items():
+        if test_id == verify.MAX_NODES:
+            checks[test_id] = None
             continue
+        if test_id in (verify.GEN_MEMORY, verify.ANNOTATE_FUNCS):
+            # per-dialect subtests: re-run them for the dialects the change can reach
+            if import_time and info is None:
+                continue
+            owners = sorted({k.split("|", 1)[0] for k in (info["changed"] if info else []) if ":" in k.split("|", 1)[0]})
+            module_keys = [k for k in (info["changed"] if info else []) if ":" not in k.split("|", 1)[0]]
+            if module_keys:
+                continue
+            dialects = verify.affected_dialects(str(MAP / "state.json"), owners, sorted(runtime))
+            if dialects is None or len(dialects) > verify.MAX_SUBSET_DIALECTS:
+                continue
+            checks[test_id] = dialects
+            continue
+        if not data:
+            continue
+        # body lines that ran during import or TestExecutor.setUpClass can break every test
+        if any(lines & data["setup"].get(path, set()) for path, lines in runtime.items()):
+            if DEBUG_HEAVY:
+                print("keep(setup)", test_id.split("::")[-1], {p: sorted(l & data["setup"].get(p, set()))[:5] for p, l in runtime.items()}, file=sys.stderr)
+            continue
+        import_relevant = False
+        if import_time and test_id == verify.TPCDS:
+            # TPCH checks re-derive everything they use on the patched code; TPC-DS's run phase
+            # is not re-run, so import-time changes it can see there must keep it.
+            if info is None:
+                if any(path in data["exec"] for path in import_time):
+                    continue
+                import_relevant = True
+            else:
+                read_files, unknown_files = diff_relevance(info, number)
+                if any(f in data["exec"] for f in read_files | unknown_files):
+                    if DEBUG_HEAVY:
+                        print("keep(diff)", read_files, unknown_files, info["changed"][:4], file=sys.stderr)
+                    continue
+                import_relevant = bool(read_files or unknown_files)
         if test_id == verify.TPCDS:
-            action, queries = verify.plan_tpcds(data, touched)
+            if any(lines & data["exec"].get(path, set()) for path, lines in runtime.items()):
+                if DEBUG_HEAVY:
+                    print("keep(exec)", {p: sorted(l & data["exec"].get(p, set()))[:5] for p, l in runtime.items()}, file=sys.stderr)
+                continue
+            if import_relevant:
+                checks[test_id] = [q["i"] for q in data["tpcds"]]
+                continue
+            action, queries = verify.plan_tpcds(data, runtime)
             if action == "drop":
-                mask &= ~(1 << heavy[test_id])
+                mask &= ~(1 << number)
             elif action == "check":
                 checks[test_id] = queries
         elif test_id == verify.TPCH:
-            if data and not any(lines & data["exec"].get(path, set()) for path, lines in touched.items()):
-                checks[test_id] = None
-        elif data or test_id == verify.MAX_NODES:
+            if any(lines & data["exec"].get(path, set()) for path, lines in runtime.items()):
+                continue
+            checks[test_id] = None
+        else:
             checks[test_id] = None
     if checks:
+        t0 = os.times()
         safe = verify.run_checks(str(BASE), str(MAP), patched, checks)
+        t1 = os.times()
+        spent = (t1.children_user + t1.children_system) - (t0.children_user + t0.children_system)
         for test_id in safe:
             mask &= ~(1 << heavy[test_id])
-        print(f"heavy checks {sorted(t.split('::')[-1] for t in checks)} safe {sorted(t.split('::')[-1] for t in safe)}", file=sys.stderr)
+        print(f"heavy checks {sorted(t.split('::')[-1] for t in checks)} safe {sorted(t.split('::')[-1] for t in safe)} cpu {spent:.2f}", file=sys.stderr)
     return mask
 
 

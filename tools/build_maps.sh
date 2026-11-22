@@ -26,8 +26,15 @@ docker run --rm --memory 8g --cpuset-cpus 0-9 -v "$SRC":/work:ro -v "$HERE/tools
   -e SKIP_INTEGRATION=0 -e PYTHONPATH=/eqp:/work -e EQ_ROOT=/work -e EQ_OUT=/eq/eq br-env \
   python -m pytest -q -n 8 -p eqplug -p no:cacheprovider tests
 python3 "$HERE/tools/export_eq.py" "$WORK/eq" "$HERE/map/eqprofile.json"
+# per-test comparison-swap profile (map/cmpprofile.json)
+mkdir -p "$WORK/cmp"
+docker run --rm --memory 8g --cpuset-cpus 0-9 -v "$SRC":/work:ro -v "$HERE/tools/cmpprofile":/cmpp:ro -v "$WORK":/cmp -w /work \
+  -e SKIP_INTEGRATION=0 -e PYTHONPATH=/cmpp:/work -e CMP_ROOT=/work -e CMP_OUT=/cmp/cmp br-env \
+  python -m pytest -q -n 8 -p cmpplug -p no:cacheprovider tests
+python3 "$HERE/tools/export_cmp.py" "$WORK/tests.json" "$WORK/cmp" "$HERE/map/cmpprofile.json"
 # per-query TPC map (map/tpc.json.gz); map/state.json is built inside the image (Dockerfile)
 docker run --rm --memory 6g --cpuset-cpus 0-9 -v "$SRC":/work:ro -v "$WORK":/iso -w /work br-env python -W ignore /iso/trace_tpcds.py /iso/tpc.json
+cp "$WORK/tpc.json.expected.pkl" "$HERE/map/tpcds_expected.pkl"
 python3 - "$WORK/tpc.json" "$HERE/map/tpc.json.gz" <<'PY'
 import gzip, json, sys
 d = json.load(open(sys.argv[1])); ex = {}

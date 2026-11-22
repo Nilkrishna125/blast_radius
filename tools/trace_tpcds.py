@@ -32,10 +32,15 @@ mon.use_tool_id(EXEC, "exec")
 hits = {FRONT: set(), EXEC: set()}
 
 
+SETUP_ONLY_FUNCTIONS = [False]
+
+
 def make_cb(tool):
     bucket = hits[tool]
     def cb(code, line):
         if code.co_filename.startswith(PREFIX):
+            if SETUP_ONLY_FUNCTIONS[0] and not (code.co_flags & 0x02):
+                return  # module/class bodies: import-time state, covered by the state diff
             bucket.add((code.co_filename, line))
         return mon.DISABLE
     return cb
@@ -50,7 +55,7 @@ def phase(tool):
     mon.set_events(EXEC, mon.events.LINE if tool == EXEC else 0)
 
 
-phase(FRONT)  # imports and setUpClass are recorded as "setup" (FRONT bucket, dumped below)
+# "setup" = function code that TestExecutor.setUpClass runs (imports are not recorded)
 
 import concurrent.futures as cf  # noqa: E402
 
@@ -82,8 +87,11 @@ from sqlglot import parse_one, serde, transpile  # noqa: E402
 from tests import test_executor as te  # noqa: E402
 from tests.helpers import TPCDS_SCHEMA  # noqa: E402
 
+SETUP_ONLY_FUNCTIONS[0] = True
+phase(FRONT)
 te.TestExecutor.setUpClass()
 phase(None)
+SETUP_ONLY_FUNCTIONS[0] = False
 
 
 def lines_of(bucket):
@@ -152,6 +160,13 @@ for i, (meta, sql, optimized) in enumerate(te.TestExecutor.tpch_sqls):
         "duck_optimized": transpile(optimized, write="duckdb")[0],
     })
 
+# What cached_execute gives the test for each executed query: DuckDB on the pinned transpile.
+expected = {}
+for q in result["tpcds"]:
+    if q["execute"] and q.get("duck_sql"):
+        expected[q["i"]] = te.TestExecutor.tpcds_conn.execute(q["duck_sql"]).fetchdf()
+with open(OUT + ".expected.pkl", "wb") as fh:
+    pickle.dump(expected, fh, protocol=5)
 with open(OUT, "w") as fh:
     json.dump(result, fh)
 print("tpcds", len(result["tpcds"]), "fingerprints", sum(1 for q in result["tpcds"] if q.get("fp")),

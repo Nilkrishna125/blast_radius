@@ -160,6 +160,62 @@ def _walk_class(cls, owner, out, seen_classes, root):
                     _walk_class(sub, owner + ".<" + attr + ">", out, seen_classes, root)
 
 
+def import_graph(root):
+    """{module: [sqlglot modules it imports]} from the source (static, AST)."""
+    import ast
+    graph = {}
+    pkg_root = os.path.join(root, "sqlglot")
+    for dirpath, _, names in os.walk(pkg_root):
+        for n in names:
+            if not n.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, n)
+            rel = os.path.relpath(path, root)[:-3].replace(os.sep, ".")
+            mod = rel[: -len(".__init__")] if rel.endswith(".__init__") else rel
+            pkg = mod if n == "__init__.py" else mod.rsplit(".", 1)[0]
+            deps = set()
+            try:
+                tree = ast.parse(open(path, encoding="utf-8").read())
+            except Exception:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        if a.name.startswith("sqlglot"):
+                            deps.add(a.name)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level:
+                        base = pkg.split(".")
+                        base = base[: len(base) - node.level + 1]
+                        target = ".".join(base + ([node.module] if node.module else []))
+                    else:
+                        target = node.module or ""
+                    if target.startswith("sqlglot"):
+                        deps.add(target)
+                        for a in node.names:
+                            deps.add(target + "." + a.name)
+            graph[mod] = sorted(deps)
+    mods = set(graph)
+    return {m: sorted(d for d in deps if d in mods and d != m) for m, deps in graph.items()}
+
+
+def dependents(graph, modules):
+    """Modules that import any of `modules`, transitively, plus the modules themselves."""
+    rev = {}
+    for m, deps in graph.items():
+        for d in deps:
+            rev.setdefault(d, set()).add(m)
+    # a package's __init__ re-exporting a module also depends on it; parents always load
+    out, todo = set(modules), list(modules)
+    while todo:
+        m = todo.pop()
+        for r in rev.get(m, ()):
+            if r not in out:
+                out.add(r)
+                todo.append(r)
+    return out
+
+
 def load_all(base=None):
     import sqlglot
     for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
@@ -178,19 +234,23 @@ def load_all(base=None):
             pass
 
 
-def snapshot(root):
-    """{key: hash} for the currently imported sqlglot (call load_all first)."""
+def snapshot(root, only=None):
+    """{key: hash} for the currently imported sqlglot (call load_all first). With `only`, just
+    those module names."""
     _MEMO.clear()
     out = {}
     seen_classes = set()
     root = os.path.abspath(root)
     for name in sorted(n for n in list(sys.modules) if n == "sqlglot" or n.startswith("sqlglot.")):
+        if only is not None and name not in only:
+            continue
         mod = sys.modules.get(name)
         f = getattr(mod, "__file__", None) or ""
         if not f:
             continue
         path = os.path.relpath(os.path.abspath(f), root)
-        names = sorted(f"{n}:{_kind(v)}" for n, v in vars(mod).items() if not n.startswith("__"))
+        # submodule attributes depend on what else was imported: not part of the state
+        names = sorted(f"{n}:{_kind(v)}" for n, v in vars(mod).items() if not n.startswith("__") and not isinstance(v, types.ModuleType))
         out[path + "|__names__"] = _h(",".join(names))
         for gname, v in sorted(vars(mod).items()):
             if gname.startswith("__") and gname.endswith("__"):
@@ -216,15 +276,48 @@ def snapshot(root):
     return out
 
 
+def dialect_classes(root):
+    """{dialect: [owner keys and file paths of its dialect/tokenizer/parser/generator classes
+    and every class in their MROs]} (call load_all first)."""
+    from sqlglot.dialects import Dialects
+    from sqlglot.dialects.dialect import Dialect
+    root = os.path.abspath(root)
+
+    def rel(cls):
+        f = getattr(sys.modules.get(cls.__module__), "__file__", None) or ""
+        return os.path.relpath(os.path.abspath(f), root) if f else None
+
+    out = {}
+    for d in Dialects:
+        klass = type(Dialect.get_or_raise(d.value))
+        items = set()
+        for attr in (None, "tokenizer_class", "jsonpath_tokenizer_class", "parser_class", "generator_class"):
+            top = klass if attr is None else getattr(klass, attr, None)
+            if not isinstance(top, type):
+                continue
+            for c in top.__mro__:
+                path = rel(c)
+                if path and path.startswith("sqlglot/"):
+                    items.add(path + ":" + c.__qualname__)
+                    items.add(path)
+            if attr is not None and top.__module__ == "sqlglot.dialects.dialect":
+                items.add(rel(klass) + ":" + klass.__qualname__ + ".<" + attr + ">")
+        out[d.value] = sorted(items)
+    return out
+
+
 if __name__ == "__main__":
     # usage: python state.py <sqlglot checkout> <out.json>
     # Run twice at image build (different PYTHONHASHSEED); merge with --merge a b out.
     import json
     if sys.argv[1] == "--merge":
         a, b = json.load(open(sys.argv[2])), json.load(open(sys.argv[3]))
+        dialects = a.pop("__dialects__"); b.pop("__dialects__")
         unstable = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+        graph = import_graph(sys.argv[5])
+        # which module each key belongs to (keys are file paths)
         with open(sys.argv[4], "w") as fh:
-            json.dump({"snapshot": a, "unstable": unstable}, fh, separators=(",", ":"))
+            json.dump({"snapshot": a, "unstable": unstable, "graph": graph, "dialects": dialects}, fh, separators=(",", ":"))
         print("keys", len(a), "unstable", len(unstable), file=sys.stderr)
         sys.exit(0)
     import warnings
@@ -233,6 +326,7 @@ if __name__ == "__main__":
     sys.path.insert(0, root)
     load_all()
     snap = snapshot(root)
+    snap["__dialects__"] = dialect_classes(root)
     with open(sys.argv[2], "w") as fh:
         json.dump(snap, fh, separators=(",", ":"))
     print("keys", len(snap), file=sys.stderr)
